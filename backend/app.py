@@ -1,4 +1,4 @@
-/import os
+import os
 import secrets
 from urllib.parse import urlparse
 
