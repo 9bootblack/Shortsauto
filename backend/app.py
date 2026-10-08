@@ -16,6 +16,8 @@ _OAUTH_TTL = 600
 
 TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
 META_TOKEN_URL = "https://graph.facebook.com/v24.0/oauth/access_token"
+IG_TOKEN_URL = "https://api.instagram.com/oauth/access_token"
+IG_LONG_TOKEN_URL = "https://graph.instagram.com/access_token"
 
 CLIENT_KEY = os.environ.get("TIKTOK_CLIENT_KEY", "").strip()
 CLIENT_SECRET = os.environ.get("TIKTOK_CLIENT_SECRET", "").strip()
@@ -24,6 +26,9 @@ META_APP_ID = os.environ.get("META_APP_ID", "").strip()
 META_APP_SECRET = os.environ.get("META_APP_SECRET", "").strip()
 META_STATE_SECRET = os.environ.get("META_STATE_SECRET", "").strip()
 META_REDIRECT_URI = os.environ.get("META_REDIRECT_URI", "").strip()
+IG_APP_ID = os.environ.get("IG_APP_ID", "").strip()
+IG_APP_SECRET = os.environ.get("IG_APP_SECRET", "").strip()
+IG_REDIRECT_URI = os.environ.get("IG_REDIRECT_URI", "").strip()
 
 
 def error(message, status=400):
@@ -62,7 +67,7 @@ def health():
         "ok": True,
         "configured": bool(CLIENT_KEY and CLIENT_SECRET and DESKTOP_API_KEY),
         "tiktok_configured": bool(CLIENT_KEY and CLIENT_SECRET and DESKTOP_API_KEY),
-        "instagram_configured": bool(META_APP_ID and META_APP_SECRET and META_REDIRECT_URI and META_STATE_SECRET and DESKTOP_API_KEY),
+        "instagram_configured": bool(IG_APP_ID and IG_APP_SECRET and IG_REDIRECT_URI and META_STATE_SECRET and DESKTOP_API_KEY),
     })
 
 
@@ -204,6 +209,89 @@ def meta_poll():
         _cleanup_oauth()
         session = _OAUTH_SESSIONS.get(state)
         if not session or not poll_key or not secrets.compare_digest(poll_key, session["poll_key"]):
+            return error("invalid_or_expired_session", 404)
+        status = session["status"]
+        if status == "done":
+            token = session.pop("token")
+            del _OAUTH_SESSIONS[state]
+            return jsonify({"ok": True, "status": "done", "access_token": token})
+        if status == "error":
+            message = session.get("message", "Erro de autorização")
+            del _OAUTH_SESSIONS[state]
+            return jsonify({"ok": False, "status": "error", "message": message})
+        return jsonify({"ok": True, "status": status})
+
+
+@app.post("/v1/instagram/start")
+def ig_start():
+    if not authorized():
+        return error("unauthorized", 401)
+    if not all((IG_APP_ID, IG_APP_SECRET, IG_REDIRECT_URI, META_STATE_SECRET)):
+        return error("instagram_login_not_configured", 503)
+    state, poll_key = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+    with _OAUTH_LOCK:
+        _cleanup_oauth()
+        _OAUTH_SESSIONS[state] = {"poll_key": poll_key, "created": time.time(),
+                                  "status": "pending", "provider": "instagram"}
+    params = {"client_id": IG_APP_ID, "redirect_uri": IG_REDIRECT_URI,
+              "response_type": "code", "state": state,
+              "scope": "instagram_business_basic,instagram_business_content_publish",
+              "enable_fb_login": "0", "force_authentication": "1"}
+    return jsonify({"ok": True, "url": "https://www.instagram.com/oauth/authorize?" + urlencode(params),
+                    "state": state, "poll_key": poll_key})
+
+
+@app.get("/v1/instagram/callback")
+def ig_callback():
+    state = request.args.get("state", "")
+    with _OAUTH_LOCK:
+        session = _OAUTH_SESSIONS.get(state)
+        if not session or session.get("provider") != "instagram" or time.time() - session["created"] > _OAUTH_TTL:
+            return Response("Sessão inválida ou expirada.", status=400)
+        if session["status"] != "pending":
+            return Response("Autorização já utilizada.", status=409)
+        if request.args.get("error"):
+            session.update(status="error", message="Autorização recusada no Instagram.")
+            return Response("Autorização cancelada. Pode fechar esta aba.", content_type="text/plain; charset=utf-8")
+        code = request.args.get("code", "")
+        if not code:
+            session.update(status="error", message="Código de autorização ausente.")
+            return Response("Código ausente.", status=400)
+        session["status"] = "processing"
+    try:
+        r = requests.post(IG_TOKEN_URL, data={"client_id": IG_APP_ID, "client_secret": IG_APP_SECRET,
+                         "grant_type": "authorization_code", "redirect_uri": IG_REDIRECT_URI,
+                         "code": code}, timeout=30)
+        payload = r.json()
+        if not r.ok or not payload.get("access_token"):
+            raise RuntimeError("Não foi possível trocar o código OAuth do Instagram.")
+        token = payload["access_token"]
+        # Troca opcional por token de longa duração (60 dias).
+        long_resp = requests.get(IG_LONG_TOKEN_URL, params={"grant_type": "ig_exchange_token",
+                            "client_secret": IG_APP_SECRET, "access_token": token}, timeout=30)
+        if long_resp.ok:
+            long_data = long_resp.json()
+            token = long_data.get("access_token") or token
+        with _OAUTH_LOCK:
+            session.update(status="done", token=token)
+        return Response("Instagram autorizado! Volte ao ShortsAuto e feche esta aba.",
+                        content_type="text/plain; charset=utf-8")
+    except (requests.RequestException, ValueError, RuntimeError):
+        with _OAUTH_LOCK:
+            session.update(status="error", message="Falha ao concluir login do Instagram.")
+        return Response("Falha ao concluir login. Volte ao ShortsAuto.", status=502)
+
+
+@app.post("/v1/instagram/poll")
+def ig_poll():
+    if not authorized():
+        return error("unauthorized", 401)
+    body = request.get_json(silent=True) or {}
+    state, poll_key = str(body.get("state", "")), str(body.get("poll_key", ""))
+    with _OAUTH_LOCK:
+        _cleanup_oauth()
+        session = _OAUTH_SESSIONS.get(state)
+        if not session or session.get("provider") != "instagram" or not poll_key or not secrets.compare_digest(poll_key, session["poll_key"]):
             return error("invalid_or_expired_session", 404)
         status = session["status"]
         if status == "done":
