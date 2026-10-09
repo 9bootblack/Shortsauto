@@ -258,28 +258,65 @@ def ig_callback():
             session.update(status="error", message="Código de autorização ausente.")
             return Response("Código ausente.", status=400)
         session["status"] = "processing"
+    # A resposta do Instagram pode conter detalhes sensíveis. Registrar apenas
+    # status HTTP, etapa e código/tipo de erro, nunca tokens ou códigos OAuth.
     try:
-        r = requests.post(IG_TOKEN_URL, data={"client_id": IG_APP_ID, "client_secret": IG_APP_SECRET,
-                         "grant_type": "authorization_code", "redirect_uri": IG_REDIRECT_URI,
-                         "code": code}, timeout=30)
-        payload = r.json()
+        r = requests.post(
+            IG_TOKEN_URL,
+            data={"client_id": IG_APP_ID, "client_secret": IG_APP_SECRET,
+                  "grant_type": "authorization_code", "redirect_uri": IG_REDIRECT_URI,
+                  "code": code},
+            timeout=30,
+        )
+        try:
+            payload = r.json()
+        except ValueError:
+            app.logger.warning("Instagram token exchange: non-JSON response, http=%s", r.status_code)
+            raise RuntimeError("Instagram retornou resposta inválida na troca do código (HTTP %s)." % r.status_code)
+        if not isinstance(payload, dict):
+            raise RuntimeError("Instagram retornou formato inválido na troca do código.")
         if not r.ok or not payload.get("access_token"):
-            raise RuntimeError("Não foi possível trocar o código OAuth do Instagram.")
+            details = payload.get("error_type") or payload.get("error") or "oauth_exchange_failed"
+            if isinstance(details, dict):
+                details = details.get("type") or "oauth_exchange_failed"
+            # Não reproduzir error_message: pode conter dados da requisição.
+            app.logger.warning("Instagram token exchange failed: http=%s, error_type=%s, error_code=%s",
+                               r.status_code, str(details)[:70], str(payload.get("code", ""))[:20])
+            raise RuntimeError("Instagram recusou a troca do código (HTTP %s, tipo: %s)." %
+                               (r.status_code, str(details)[:70]))
         token = payload["access_token"]
-        # Troca opcional por token de longa duração (60 dias).
-        long_resp = requests.get(IG_LONG_TOKEN_URL, params={"grant_type": "ig_exchange_token",
-                            "client_secret": IG_APP_SECRET, "access_token": token}, timeout=30)
-        if long_resp.ok:
-            long_data = long_resp.json()
-            token = long_data.get("access_token") or token
+        # O token longo é opcional: se a troca falhar, preservar o token curto.
+        try:
+            long_resp = requests.get(
+                IG_LONG_TOKEN_URL,
+                params={"grant_type": "ig_exchange_token", "client_secret": IG_APP_SECRET,
+                        "access_token": token}, timeout=30,
+            )
+            if long_resp.ok:
+                try:
+                    long_data = long_resp.json()
+                    if isinstance(long_data, dict):
+                        token = long_data.get("access_token") or token
+                except ValueError:
+                    app.logger.warning("Instagram long-lived token: non-JSON response")
+            else:
+                app.logger.warning("Instagram long-lived token exchange failed: http=%s", long_resp.status_code)
+        except requests.RequestException as exc:
+            app.logger.warning("Instagram long-lived token unavailable: %s", type(exc).__name__)
         with _OAUTH_LOCK:
             session.update(status="done", token=token)
         return Response("Instagram autorizado! Volte ao ShortsAuto e feche esta aba.",
                         content_type="text/plain; charset=utf-8")
-    except (requests.RequestException, ValueError, RuntimeError):
+    except (requests.RequestException, ValueError, RuntimeError) as exc:
+        if isinstance(exc, requests.RequestException):
+            message = "Erro de conexão ao trocar o código com Instagram (%s)." % type(exc).__name__
+            app.logger.warning("Instagram token exchange network failure: %s", type(exc).__name__)
+        else:
+            message = str(exc)
         with _OAUTH_LOCK:
-            session.update(status="error", message="Falha ao concluir login do Instagram.")
-        return Response("Falha ao concluir login. Volte ao ShortsAuto.", status=502)
+            session.update(status="error", message=message[:220])
+        return Response("Falha ao concluir login. Veja o erro no ShortsAuto.", status=502,
+                        content_type="text/plain; charset=utf-8")
 
 
 @app.post("/v1/instagram/poll")
